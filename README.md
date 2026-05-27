@@ -39,8 +39,8 @@ cargo install cargo-generate-rpm
 cargo build --release
 strip target/release/dchunked
 cargo generate-rpm
-# 产物在 target/generic-rpm/*.rpm
-sudo rpm -i target/generic-rpm/*.rpm
+# 产物在 target/generate-rpm/*.rpm
+sudo rpm -i target/generate-rpm/*.rpm
 ```
 
 **DEB (Ubuntu/Debian)：**
@@ -50,6 +50,32 @@ cargo install cargo-deb
 cargo deb
 # 产物在 target/debian/*.deb
 sudo dpkg -i target/debian/*.deb
+```
+
+### 从 rpm/deb 包安装
+
+从 [Releases](https://github.com/bevin1984/dchunked/releases) 页面下载对应包后安装：
+
+**RPM (CentOS/RHEL)：**
+
+```bash
+sudo rpm -i dchunked-*.x86_64.rpm
+```
+
+**DEB (Ubuntu/Debian)：**
+
+```bash
+sudo dpkg -i dchunked_*_amd64.deb
+```
+
+安装完成后即可全局使用 `dchunked` 命令。卸载方式：
+
+```bash
+# RPM
+sudo rpm -e dchunked
+
+# DEB
+sudo dpkg -r dchunked
 ```
 
 ## 使用说明

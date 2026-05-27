@@ -1,0 +1,11 @@
+# DChunked proxy pool config example
+# Usage: dchunked <URL> -p config.toml
+
+[[proxies]]
+addr = "socks5h://user:pass@host1:1080"
+
+[[proxies]]
+addr = "socks5h://host2:1080"
+
+[[proxies]]
+addr = "socks5h://user:pass@host3:7890"

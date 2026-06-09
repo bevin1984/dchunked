@@ -4,63 +4,63 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::block::BlockRange;
 use crate::error::DChunkedError;
-use crate::planner::ChunkRange;
-use crate::progress::ChunkProgress;
+use crate::progress::WorkerProgress;
 use crate::proxy::ProxyPool;
 
-pub struct ChunkResult {
+pub struct BlockResult {
     pub index: usize,
-    pub temp_path: PathBuf,
+    #[allow(dead_code)]
+    pub path: PathBuf,
 }
 
-pub async fn download_chunk(
-    chunk: ChunkRange,
+pub async fn download_block(
+    block: BlockRange,
     url: &str,
-    output_dir: &std::path::Path,
-    output_file: &str,
+    block_dir: &std::path::Path,
     timeout: u64,
     max_retries: u32,
     pool: Arc<ProxyPool>,
-    progress: Arc<ChunkProgress>,
-) -> Result<ChunkResult, DChunkedError> {
-    let temp_path = output_dir.join(format!(".{}.{}.part", output_file, chunk.index));
-    let chunk_size = chunk.end - chunk.start + 1;
+    progress: Arc<WorkerProgress>,
+) -> Result<BlockResult, DChunkedError> {
+    let block_path = block_dir.join(format!("{}.block", block.index));
+    let block_size = block.expected_size;
     let mut progress_reported: u64 = 0;
 
-    // Check for already-complete chunk from previous run
-    if let Ok(meta) = tokio::fs::metadata(&temp_path).await {
-        if meta.len() >= chunk_size {
-            eprintln!("  chunk {}: already complete, skipping", chunk.index);
-            progress.inc(chunk_size);
-            return Ok(ChunkResult {
-                index: chunk.index,
-                temp_path,
+    // Check for already-complete block from previous run
+    if let Ok(meta) = tokio::fs::metadata(&block_path).await {
+        if meta.len() >= block_size {
+            eprintln!("  block {}: already complete, skipping", block.index);
+            progress.inc(block_size);
+            return Ok(BlockResult {
+                index: block.index,
+                path: block_path,
             });
         }
     }
 
     for attempt in 0..max_retries {
         // Recalculate resume offset from actual file size on each attempt
-        let resume_offset = match tokio::fs::metadata(&temp_path).await {
-            Ok(meta) => meta.len().min(chunk_size),
+        let resume_offset = match tokio::fs::metadata(&block_path).await {
+            Ok(meta) => meta.len().min(block_size),
             Err(_) => 0,
         };
 
         // Report progress for already-downloaded but not-yet-reported bytes
         if resume_offset > progress_reported {
             eprintln!(
-                "  chunk {}: resuming from {} bytes",
-                chunk.index, resume_offset
+                "  block {}: resuming from {} bytes",
+                block.index, resume_offset
             );
             progress.inc(resume_offset - progress_reported);
             progress_reported = resume_offset;
         }
 
-        if resume_offset >= chunk_size {
-            return Ok(ChunkResult {
-                index: chunk.index,
-                temp_path,
+        if resume_offset >= block_size {
+            return Ok(BlockResult {
+                index: block.index,
+                path: block_path,
             });
         }
 
@@ -78,8 +78,8 @@ pub async fn download_chunk(
                 }
                 Err(e) => {
                     eprintln!(
-                        "  chunk {}: proxy parse error (attempt {}/{}): {}",
-                        chunk.index,
+                        "  block {}: proxy parse error (attempt {}/{}): {}",
+                        block.index,
                         attempt + 1,
                         max_retries,
                         e
@@ -96,8 +96,8 @@ pub async fn download_chunk(
             Ok(c) => c,
             Err(e) => {
                 eprintln!(
-                    "  chunk {}: client build error (attempt {}/{}): {}",
-                    chunk.index,
+                    "  block {}: client build error (attempt {}/{}): {}",
+                    block.index,
                     attempt + 1,
                     max_retries,
                     e
@@ -106,14 +106,14 @@ pub async fn download_chunk(
             }
         };
 
-        let range_start = chunk.start + resume_offset;
-        let range_header = format!("bytes={}-{}", range_start, chunk.end);
+        let range_start = block.start + resume_offset;
+        let range_header = format!("bytes={}-{}", range_start, block.end);
         let resp = match client.get(url).header("Range", &range_header).send().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
-                    "  chunk {}: request error (attempt {}/{}): {}",
-                    chunk.index,
+                    "  block {}: request error (attempt {}/{}): {}",
+                    block.index,
                     attempt + 1,
                     max_retries,
                     e
@@ -132,13 +132,13 @@ pub async fn download_chunk(
             }
             if status.as_u16() >= 400 && status.as_u16() < 500 {
                 return Err(DChunkedError::Config(format!(
-                    "HTTP {} for chunk {} (client error, not retrying)",
-                    status, chunk.index
+                    "HTTP {} for block {} (client error, not retrying)",
+                    status, block.index
                 )));
             }
             eprintln!(
-                "  chunk {}: HTTP {} (attempt {}/{})",
-                chunk.index,
+                "  block {}: HTTP {} (attempt {}/{})",
+                block.index,
                 status,
                 attempt + 1,
                 max_retries
@@ -149,7 +149,7 @@ pub async fn download_chunk(
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&temp_path)
+            .open(&block_path)
             .await
             .map_err(DChunkedError::Io)?;
 
@@ -174,8 +174,8 @@ pub async fn download_chunk(
 
         if let Some(ref err) = stream_error {
             eprintln!(
-                "  chunk {}: stream error (attempt {}/{}): {}",
-                chunk.index,
+                "  block {}: stream error (attempt {}/{}): {}",
+                block.index,
                 attempt + 1,
                 max_retries,
                 err
@@ -192,14 +192,14 @@ pub async fn download_chunk(
             pool.report_success(idx).await;
         }
 
-        return Ok(ChunkResult {
-            index: chunk.index,
-            temp_path,
+        return Ok(BlockResult {
+            index: block.index,
+            path: block_path,
         });
     }
 
     Err(DChunkedError::RetryExhausted {
-        chunk_id: chunk.index,
+        chunk_id: block.index,
         retries: max_retries,
     })
 }

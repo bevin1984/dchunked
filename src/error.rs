@@ -24,4 +24,7 @@ pub enum DChunkedError {
 
     #[error("Invalid URL: {0}")]
     InvalidUrl(String),
+
+    #[error("Invalid block size: {0}")]
+    InvalidBlockSize(String),
 }

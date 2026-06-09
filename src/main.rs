@@ -1,8 +1,8 @@
+mod block;
 mod cli;
 mod config;
 mod error;
 mod merger;
-mod planner;
 mod progress;
 mod proxy;
 mod worker;
@@ -34,7 +34,10 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    let first_proxy = proxy_addrs.first().map(|s| reqwest::Proxy::all(s)).transpose()?;
+    let first_proxy = proxy_addrs
+        .first()
+        .map(|s| reqwest::Proxy::all(s))
+        .transpose()?;
     let pool = proxy::ProxyPool::new(proxy_addrs);
     let output = args
         .output
@@ -52,29 +55,25 @@ async fn async_main() -> anyhow::Result<()> {
 
     let head_client = head_builder.build()?;
 
-    // Plan chunks
-    let plan = planner::plan(&head_client, &args.url, args.chunks).await?;
+    // Plan blocks
+    let block_plan = block::plan_blocks(&head_client, &args.url, args.block_size).await?;
 
-    if plan.supports_range {
+    if block_plan.supports_range {
         eprintln!(
-            "File size: {} bytes, downloading in {} chunks",
-            plan.total_size,
-            plan.chunks.len()
+            "File size: {} bytes, {} blocks ({} bytes/block), {} workers",
+            block_plan.total_size,
+            block_plan.blocks.len(),
+            args.block_size,
+            args.chunks,
         );
     } else {
         eprintln!(
             "File size: {} bytes, downloading (no range support)",
-            plan.total_size
+            block_plan.total_size,
         );
     }
 
-    // Setup progress
-    let prog = Arc::new(progress::DownloadProgress::new(
-        plan.total_size,
-        plan.chunks.len(),
-    ));
-
-    // Spawn download tasks
+    // Determine output path and hidden directory
     let output_path = Path::new(&output);
     let output_dir = output_path
         .parent()
@@ -85,29 +84,117 @@ async fn async_main() -> anyhow::Result<()> {
         .unwrap_or(std::ffi::OsStr::new("download"))
         .to_string_lossy()
         .to_string();
+    let block_dir = output_dir.join(format!(".{}", output_filename));
+    let manifest_path = block_dir.join("manifest.toml");
+
+    // Resume: scan existing blocks
+    let existing_completed = block::scan_existing_blocks(&block_dir, &block_plan);
+
+    let already_done = existing_completed.iter().filter(|&&b| b).count();
+    if already_done > 0 {
+        eprintln!(
+            "Resuming: {}/{} blocks already complete",
+            already_done,
+            block_plan.blocks.len()
+        );
+    }
+
+    // Create block dir and write manifest
+    block::init_block_dir(&block_dir, &block_plan, &args.url, &existing_completed)?;
+
+    // Create scheduler
+    let scheduler = Arc::new(block::BlockScheduler::new(
+        block_plan.blocks.clone(),
+        block_dir.clone(),
+        manifest_path,
+        &existing_completed,
+        args.url.clone(),
+        block_plan.total_size,
+        args.block_size,
+    ));
+
+    // Setup progress
+    let num_workers = args.chunks.min(block_plan.blocks.len());
+    let prog = Arc::new(progress::DownloadProgress::new(
+        block_plan.total_size,
+        num_workers,
+    ));
+
+    // Count already-downloaded bytes toward progress
+    let done_bytes: u64 = existing_completed
+        .iter()
+        .enumerate()
+        .filter(|(_, &done)| done)
+        .map(|(i, _)| block_plan.blocks[i].expected_size)
+        .sum();
+    if done_bytes > 0 {
+        // Use a hidden progress to report pre-existing bytes
+        for (i, &done) in existing_completed.iter().enumerate() {
+            if done {
+                let wp = prog.worker_progress(0, i, block_plan.blocks[i].expected_size);
+                wp.inc(block_plan.blocks[i].expected_size);
+            }
+        }
+    }
+
+    // Spawn N worker tasks
     let mut handles = Vec::new();
-    for chunk in plan.chunks {
+    for worker_id in 0..num_workers {
         let url = args.url.clone();
-        let dir = output_dir.clone();
-        let fname = output_filename.clone();
         let timeout = args.timeout;
         let retry = args.retry;
         let pool = pool.clone();
-        let chunk_prog = prog.chunk_progress(chunk.index);
+        let scheduler = scheduler.clone();
+        let prog = prog.clone();
 
         let handle = tokio::spawn(async move {
-            worker::download_chunk(chunk, &url, &dir, &fname, timeout, retry, pool, chunk_prog)
+            loop {
+                let assignment = match scheduler.acquire_next() {
+                    Some(a) => a,
+                    None => break,
+                };
+
+                let block_index = assignment.block.index;
+                let block_prog = prog.worker_progress(
+                    worker_id,
+                    block_index,
+                    assignment.block.expected_size,
+                );
+
+                match worker::download_block(
+                    assignment.block,
+                    &url,
+                    &assignment.block_dir,
+                    timeout,
+                    retry,
+                    pool.clone(),
+                    block_prog,
+                )
                 .await
+                {
+                    Ok(result) => {
+                        scheduler.mark_complete(result.index);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Worker {}: block {} failed: {}",
+                            worker_id, block_index, e
+                        );
+                        scheduler.release(block_index);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
         });
         handles.push(handle);
     }
 
-    // Await all tasks
-    let mut results = Vec::new();
+    // Await all workers
     let mut errors = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok(Ok(result)) => results.push(result),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => errors.push(e.to_string()),
             Err(e) => errors.push(format!("Task panicked: {e}")),
         }
@@ -118,16 +205,26 @@ async fn async_main() -> anyhow::Result<()> {
             eprintln!("Error: {err}");
         }
         anyhow::bail!(
-            "Download failed: {} chunk(s) failed, re-run to resume",
+            "Download failed: {} block(s) failed, re-run to resume",
             errors.len()
         );
     }
 
-    // Merge
-    merger::merge_chunks(results, Path::new(&output), plan.total_size).await?;
-
+    // Merge blocks into final file
     prog.finish();
-    eprintln!("Download complete: {}", output);
+    eprintln!("Merging {} blocks into {} ...", block_plan.blocks.len(), output);
+    merger::merge_blocks(
+        &block_dir,
+        block_plan.blocks.len(),
+        Path::new(&output),
+        block_plan.total_size,
+    )
+    .await?;
+
+    // Cleanup hidden directory
+    let _ = tokio::fs::remove_dir_all(&block_dir).await;
+
+    eprintln!("\nDownload complete: {}", output);
 
     Ok(())
 }

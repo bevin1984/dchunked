@@ -3,28 +3,32 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-const MAX_CHUNK_BARS: usize = 16;
-
-pub struct ChunkProgress {
+pub struct WorkerProgress {
     pb: ProgressBar,
     overall: ProgressBar,
 }
 
-impl ChunkProgress {
+impl WorkerProgress {
     pub fn inc(&self, bytes: u64) {
         self.pb.inc(bytes);
         self.overall.inc(bytes);
     }
+
+    pub fn set_block(&self, block_index: usize, block_size: u64) {
+        self.pb.reset();
+        self.pb.set_length(block_size);
+        self.pb.set_message(format!("block {} ", block_index));
+    }
 }
 
 pub struct DownloadProgress {
-    _multi: Arc<MultiProgress>,
+    multi: Arc<MultiProgress>,
     overall: ProgressBar,
-    chunks: Vec<Arc<ChunkProgress>>,
+    workers: Vec<Arc<WorkerProgress>>,
 }
 
 impl DownloadProgress {
-    pub fn new(total_size: u64, num_chunks: usize) -> Self {
+    pub fn new(total_size: u64, num_workers: usize) -> Self {
         let multi = Arc::new(MultiProgress::new());
 
         let overall = multi.add(ProgressBar::new(total_size));
@@ -37,49 +41,43 @@ impl DownloadProgress {
         );
         overall.enable_steady_tick(Duration::from_millis(500));
 
-        let chunk_size = total_size / num_chunks.max(1) as u64;
-        let show_chunks = num_chunks <= MAX_CHUNK_BARS;
-
-        let chunks: Vec<Arc<ChunkProgress>> = if show_chunks {
-            (0..num_chunks)
-                .map(|i| {
-                    let pb = multi.add(ProgressBar::new(chunk_size));
-                    pb.set_style(
-                        ProgressStyle::with_template(&format!(
-                            "  chunk {i}: [{{bar:30.cyan/blue}}] {{bytes}}/{{total_bytes}}"
-                        ))
-                        .unwrap()
-                        .progress_chars("#>-"),
-                    );
-                    Arc::new(ChunkProgress {
-                        pb,
-                        overall: overall.clone(),
-                    })
+        let workers: Vec<Arc<WorkerProgress>> = (0..num_workers)
+            .map(|id| {
+                let pb = multi.add(ProgressBar::new(0));
+                pb.set_style(
+                    ProgressStyle::with_template(&format!(
+                        "  worker {id}: {{msg}}[{{bar:30.cyan/blue}}] {{bytes}}/{{total_bytes}}"
+                    ))
+                    .unwrap()
+                    .progress_chars("#>-"),
+                );
+                Arc::new(WorkerProgress {
+                    pb,
+                    overall: overall.clone(),
                 })
-                .collect()
-        } else {
-            (0..num_chunks)
-                .map(|_| {
-                    Arc::new(ChunkProgress {
-                        pb: ProgressBar::hidden(),
-                        overall: overall.clone(),
-                    })
-                })
-                .collect()
-        };
+            })
+            .collect();
 
         Self {
-            _multi: multi,
+            multi,
             overall,
-            chunks,
+            workers,
         }
     }
 
-    pub fn chunk_progress(&self, index: usize) -> Arc<ChunkProgress> {
-        self.chunks[index].clone()
+    pub fn worker_progress(&self, worker_id: usize, block_index: usize, block_size: u64) -> Arc<WorkerProgress> {
+        let wp = self.workers[worker_id].clone();
+        wp.set_block(block_index, block_size);
+        wp
     }
 
     pub fn finish(&self) {
+        // Finish all worker bars first, then the overall bar
+        for wp in &self.workers {
+            wp.pb.finish_and_clear();
+        }
         self.overall.finish_and_clear();
+        // Ensure the MultiProgress stops drawing
+        self.multi.clear().unwrap_or(());
     }
 }

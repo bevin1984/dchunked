@@ -71,6 +71,10 @@ impl DownloadProgress {
         wp
     }
 
+    pub fn reset_overall_eta(&self) {
+        self.overall.reset_eta();
+    }
+
     pub fn finish(&self) {
         // Finish all worker bars first, then the overall bar
         for wp in &self.workers {

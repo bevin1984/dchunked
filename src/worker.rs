@@ -23,6 +23,7 @@ pub async fn download_block(
     max_retries: u32,
     pool: Arc<ProxyPool>,
     progress: Arc<WorkerProgress>,
+    supports_range: bool,
 ) -> Result<BlockResult, DChunkedError> {
     let block_path = block_dir.join(format!("{}.block", block.index));
     let block_size = block.expected_size;
@@ -30,13 +31,21 @@ pub async fn download_block(
 
     // Check for already-complete block from previous run
     if let Ok(meta) = tokio::fs::metadata(&block_path).await {
-        if meta.len() >= block_size {
+        let len = meta.len();
+        if len == block_size {
             eprintln!("  block {}: already complete, skipping", block.index);
             progress.inc(block_size);
             return Ok(BlockResult {
                 index: block.index,
                 path: block_path,
             });
+        }
+        if len > block_size {
+            eprintln!(
+                "  block {}: existing file larger than expected ({} > {}), removing",
+                block.index, len, block_size
+            );
+            let _ = tokio::fs::remove_file(&block_path).await;
         }
     }
 
@@ -55,13 +64,6 @@ pub async fn download_block(
             );
             progress.inc(resume_offset - progress_reported);
             progress_reported = resume_offset;
-        }
-
-        if resume_offset >= block_size {
-            return Ok(BlockResult {
-                index: block.index,
-                path: block_path,
-            });
         }
 
         let lease = pool.lease().await;
@@ -146,6 +148,48 @@ pub async fn download_block(
             continue;
         }
 
+        let expected_status: u16 = if supports_range { 206 } else { 200 };
+        if status.as_u16() != expected_status {
+            eprintln!(
+                "  block {}: unexpected status {} (expected {}) (attempt {}/{})",
+                block.index,
+                status,
+                expected_status,
+                attempt + 1,
+                max_retries
+            );
+            if let Some(idx) = lease.proxy_index {
+                pool.report_failure(idx).await;
+            }
+            continue;
+        }
+
+        if status.as_u16() == 206 {
+            let content_range = resp
+                .headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let actual_start = content_range
+                .strip_prefix("bytes ")
+                .and_then(|s| s.split('-').next())
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            if actual_start != Some(range_start) {
+                eprintln!(
+                    "  block {}: Content-Range mismatch ({}), expected start {} (attempt {}/{})",
+                    block.index,
+                    content_range,
+                    range_start,
+                    attempt + 1,
+                    max_retries
+                );
+                if let Some(idx) = lease.proxy_index {
+                    pool.report_failure(idx).await;
+                }
+                continue;
+            }
+        }
+
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -187,6 +231,24 @@ pub async fn download_block(
         }
 
         file.flush().await?;
+
+        let actual_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        if actual_size != block.expected_size {
+            eprintln!(
+                "  block {}: size mismatch actual={} expected={} (attempt {}/{})",
+                block.index,
+                actual_size,
+                block.expected_size,
+                attempt + 1,
+                max_retries
+            );
+            drop(file);
+            let _ = tokio::fs::remove_file(&block_path).await;
+            if let Some(idx) = lease.proxy_index {
+                pool.report_failure(idx).await;
+            }
+            continue;
+        }
 
         if let Some(idx) = lease.proxy_index {
             pool.report_success(idx).await;

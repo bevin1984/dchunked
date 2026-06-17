@@ -33,10 +33,13 @@ pub struct BlockAssignment {
     pub block_dir: PathBuf,
 }
 
+pub const MAX_FAILURES_PER_BLOCK: usize = 5;
+
 pub struct BlockScheduler {
     blocks: Vec<BlockRange>,
     completed: Vec<AtomicBool>,
     in_progress: Vec<AtomicBool>,
+    failure_counts: Vec<AtomicUsize>,
     next_cursor: AtomicUsize,
     block_dir: PathBuf,
     manifest_path: PathBuf,
@@ -61,11 +64,14 @@ impl BlockScheduler {
             .map(|(i, _)| AtomicBool::new(existing_completed.get(i).copied().unwrap_or(false)))
             .collect();
         let in_progress: Vec<AtomicBool> = blocks.iter().map(|_| AtomicBool::new(false)).collect();
+        let failure_counts: Vec<AtomicUsize> =
+            blocks.iter().map(|_| AtomicUsize::new(0)).collect();
 
         Self {
             blocks,
             completed,
             in_progress,
+            failure_counts,
             next_cursor: AtomicUsize::new(0),
             block_dir,
             manifest_path,
@@ -86,6 +92,10 @@ impl BlockScheduler {
             let i = (start + offset) % len;
 
             if self.completed[i].load(Ordering::Acquire) {
+                continue;
+            }
+
+            if self.failure_counts[i].load(Ordering::Acquire) >= MAX_FAILURES_PER_BLOCK {
                 continue;
             }
 
@@ -112,6 +122,19 @@ impl BlockScheduler {
 
     pub fn release(&self, index: usize) {
         self.in_progress[index].store(false, Ordering::Release);
+    }
+
+    pub fn record_failure(&self, index: usize) -> usize {
+        self.failure_counts[index].fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn failed_blocks(&self) -> Vec<usize> {
+        self.failure_counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.load(Ordering::Acquire) >= MAX_FAILURES_PER_BLOCK)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     fn persist_manifest(&self) {

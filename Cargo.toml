@@ -1,6 +1,6 @@
 [package]
 name = "dchunked"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Chunked HTTP downloader with SOCKS5 proxy pool support"
 license = "MIT"
@@ -20,6 +20,14 @@ thiserror = "2"
 anyhow = "1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
+
+[package.metadata.deb]
+maintainer = "bevin1984 <bevin1984@gmail.com>"
+copyright = "2026, bevin1984"
+depends = []
+assets = [
+    { source = "target/release/dchunked", dest = "usr/bin/dchunked", mode = "755" },
+]
 
 [package.metadata.generate-rpm]
 assets = [

@@ -135,9 +135,12 @@ async fn async_main() -> anyhow::Result<()> {
                 wp.inc(block_plan.blocks[i].expected_size);
             }
         }
+        // 清除初始 done_bytes 瞬时 inc 对速度估算的污染
+        prog.reset_overall_eta();
     }
 
     // Spawn N worker tasks
+    let supports_range = block_plan.supports_range;
     let mut handles = Vec::new();
     for worker_id in 0..num_workers {
         let url = args.url.clone();
@@ -169,6 +172,7 @@ async fn async_main() -> anyhow::Result<()> {
                     retry,
                     pool.clone(),
                     block_prog,
+                    supports_range,
                 )
                 .await
                 {
@@ -180,33 +184,50 @@ async fn async_main() -> anyhow::Result<()> {
                             "Worker {}: block {} failed: {}",
                             worker_id, block_index, e
                         );
+                        let failures = scheduler.record_failure(block_index);
                         scheduler.release(block_index);
-                        return Err(e);
+                        if failures >= block::MAX_FAILURES_PER_BLOCK {
+                            eprintln!(
+                                "Worker {}: block {} reached failure threshold ({}), will skip",
+                                worker_id, block_index, failures
+                            );
+                        }
+                        continue;
                     }
                 }
             }
-            Ok(())
         });
         handles.push(handle);
     }
 
     // Await all workers
-    let mut errors = Vec::new();
+    let mut panics = Vec::new();
     for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => errors.push(e.to_string()),
-            Err(e) => errors.push(format!("Task panicked: {e}")),
+        if let Err(e) = handle.await {
+            eprintln!("Worker task panicked: {e}");
+            panics.push(e.to_string());
         }
     }
 
-    if !errors.is_empty() {
-        for err in &errors {
-            eprintln!("Error: {err}");
+    let failed = scheduler.failed_blocks();
+    if !panics.is_empty() || !failed.is_empty() {
+        let mut msg = String::new();
+        if !failed.is_empty() {
+            msg.push_str(&format!(
+                "{} block(s) reached failure threshold {:?}; ",
+                failed.len(),
+                failed
+            ));
+        }
+        if !panics.is_empty() {
+            msg.push_str(&format!(
+                "{} worker task(s) panicked; ",
+                panics.len()
+            ));
         }
         anyhow::bail!(
-            "Download failed: {} block(s) failed, re-run to resume",
-            errors.len()
+            "Download failed: {}re-run to resume (already-downloaded bytes are preserved)",
+            msg
         );
     }
 
@@ -215,7 +236,7 @@ async fn async_main() -> anyhow::Result<()> {
     eprintln!("Merging {} blocks into {} ...", block_plan.blocks.len(), output);
     merger::merge_blocks(
         &block_dir,
-        block_plan.blocks.len(),
+        &block_plan.blocks,
         Path::new(&output),
         block_plan.total_size,
     )
